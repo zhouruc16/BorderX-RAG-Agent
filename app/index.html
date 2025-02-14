@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Agent Chat</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f4f4f4;
+        }
+        #chat-container {
+            width: 50%;
+            margin: auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0px 0px 10px rgba(0, 0, 0, 0.1);
+        }
+        .message {
+            margin-bottom: 10px;
+            padding: 10px;
+            border-radius: 5px;
+        }
+        .user {
+            background-color: #d1e7fd;
+            text-align: right;
+        }
+        .bot {
+            background-color: #e2e2e2;
+            text-align: left;
+        }
+        input, button {
+            width: 100%;
+            padding: 10px;
+            margin-top: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div id="chat-container">
+        <h2>RAG Agent Chat</h2>
+        <div id="chat-box"></div>
+        <input type="text" id="user-input" placeholder="Ask a question...">
+        <button onclick="sendQuery()">Send</button>
+    </div>
+
+    <script>
+        async function sendQuery() {
+            let inputField = document.getElementById("user-input");
+            let query = inputField.value.trim();
+            if (!query) return;
+
+            addMessage("You: " + query, "user");
+            inputField.value = ""; // Clear input
+
+            try {
+                let response = await fetch("http://127.0.0.1:8000/query/", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ query: query })
+                });
+
+                let data = await response.json();
+                let answer = data.answer || "No answer received.";
+                let references = data.references || "No references found.";
+
+                addMessage("🤖: " + answer + "\n\n📄 References: " + references, "bot");
+            } catch (error) {
+                addMessage("⚠️ Error: Unable to reach server.", "bot");
+            }
+        }
+
+        function addMessage(text, sender) {
+            let chatBox = document.getElementById("chat-box");
+            let messageDiv = document.createElement("div");
+            messageDiv.className = "message " + sender;
+            messageDiv.innerText = text;
+            chatBox.appendChild(messageDiv);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    </script>
+</body>
+</html>

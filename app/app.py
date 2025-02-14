@@ -1,35 +1,23 @@
-from utils import build_pdf_vectorstore, answer_query
+import os
+from app.utils import build_pdf_vectorstore, load_local_index
+from app.chat import interactive_session
+
+PDF_DIRECTORY = "resources/pdf"
+INDEX_PATH = "resources/vectorspace"
 
 def main():
-    # Set the directory containing your PDF files.
-    pdf_directory = "resources/pdf"
-    
-    # Build the vector store directly from PDFs.
-    print("Building vector store...")
-    vector_store = build_pdf_vectorstore(pdf_directory,
-                                         tesseract_cmd=None,  # Adjust if needed
-                                         min_text_chars=30,
-                                         dpi=300,
-                                         chunk_size=500,
-                                         chunk_overlap=100)
-    
-    print("Vector store successfully built. The following document chunks are stored:")
-    for doc in vector_store.docstore._dict.values():
-        source = doc.metadata.get("source", "Unknown")
-        page = doc.metadata.get("page", "Unknown")
-        print(f"Document from {source} - Page {page}")
-    
-    # Get the user query.
-    query = input("Enter your query: ")
-    
-    try:
-        result = answer_query(vector_store, query, k=3)
-        print("\n--- Final Answer ---")
-        print(result["answer"])
-        print("\n--- References ---")
-        print(result["references"])
-    except Exception as e:
-        print(f"An error occurred: {e}")
+    """Ensure FAISS index exists before starting interactive chat."""
+    if not os.path.exists(INDEX_PATH) or not os.path.exists(os.path.join(INDEX_PATH, "index.faiss")):
+        print(f"Vector store not found. Building from PDFs in {PDF_DIRECTORY}...")
+        os.makedirs(INDEX_PATH, exist_ok=True)  # Ensure directory exists
+        vector_store = build_pdf_vectorstore(PDF_DIRECTORY, index_save_path=INDEX_PATH)
+        print(f"Vector store saved at {INDEX_PATH}")
+    else:
+        print(f"Loading existing vector store from {INDEX_PATH}...")
+        vector_store = load_local_index(INDEX_PATH)
+
+    print("\n✅ Vector store is ready! You can now start asking questions.\n")
+    interactive_session(vector_store)
 
 if __name__ == "__main__":
     main()

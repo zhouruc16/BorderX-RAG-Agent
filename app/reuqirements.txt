@@ -1,0 +1,13 @@
+# For extracting text and images from PDFs
+pdfplumber
+pytesseract
+pdf2image
+
+# LangChain and its dependencies (used for document splitting, embeddings, and FAISS vector store)
+langchain
+faiss-cpu
+sentence-transformers
+
+# Ollama Python SDK for interacting with Ollama via its API
+ollama
+httpx

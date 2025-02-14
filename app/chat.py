@@ -1,7 +1,7 @@
 from ollama import chat
-from langchain.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-from utils import retrieve_context, load_local_index
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from app.utils import retrieve_context, load_local_index
 
 
 def deepseek_chat(vectorstore: FAISS, query: str, k: int = 3, model: str = "deepseek-r1:1.5b") -> dict:

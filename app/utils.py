@@ -7,8 +7,8 @@ import pytesseract
 from pdf2image import convert_from_path
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
 
 # Disable parallelism warnings from HuggingFace tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
