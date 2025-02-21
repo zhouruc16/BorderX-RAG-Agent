@@ -1,248 +1,195 @@
 import os
-from typing import List
+import torch
+import time
+from pdfminer.pdfparser import PDFSyntaxError
 import subprocess
-
+import faiss
+from typing import List
 import pdfplumber
 import pytesseract
 from pdf2image import convert_from_path
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
+# Use updated community imports:
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 
 # Disable parallelism warnings from HuggingFace tokenizers
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Determine the device for GPU usage
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Using device: {device.upper()}")
+
+# Initialize EasyOCR instead of Tesseract
+try:
+    import easyocr
+    import numpy as np
+    ocr_gpu = True if device == "cuda" else False
+    reader = easyocr.Reader(['en'], gpu=ocr_gpu)
+    print("✅ EasyOCR initialized successfully.")
+except Exception as e:
+    print("⚠️ Failed to initialize EasyOCR:", e)
+    reader = None
 
 def extract_documents_from_pdf(pdf_path: str,
-                               tesseract_cmd: str = None,
                                min_text_chars: int = 30,
                                dpi: int = 300) -> List[Document]:
     """
-    Extracts text from a PDF file page by page.
-    Uses direct extraction via pdfplumber; if a page returns too little text,
-    it falls back to OCR via pytesseract.
-    
-    Args:
-        pdf_path (str): Path to the PDF file.
-        tesseract_cmd (str, optional): Full path to Tesseract executable if not on PATH.
-        min_text_chars (int, optional): Minimum number of characters to consider the page valid.
-        dpi (int, optional): Resolution for converting PDF pages to images for OCR.
-    
-    Returns:
-        List[Document]: A list of Document objects (one per page) with metadata.
+    Extracts text from a PDF file page by page using pdfplumber.
+    If a page returns too little text, it falls back to OCR using EasyOCR.
     """
-    if tesseract_cmd:
-        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
-
     documents = []
-    with pdfplumber.open(pdf_path) as pdf:
-        total_pages = len(pdf.pages)
-        for page_number in range(total_pages):
-            page = pdf.pages[page_number]
-            page_text = page.extract_text() or ""
-            page_text = page_text.strip()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            total_pages = len(pdf.pages)
+            for page_number in range(total_pages):
+                page = pdf.pages[page_number]
+                page_text = page.extract_text() or ""
+                page_text = page_text.strip()
 
-            # If extracted text is too short, fallback to OCR
-            if len(page_text) < min_text_chars:
-                images = convert_from_path(pdf_path, dpi=dpi,
-                                           first_page=page_number + 1,
-                                           last_page=page_number + 1)
-                if images:
-                    ocr_text = pytesseract.image_to_string(images[0]) or ""
-                    ocr_text = ocr_text.strip()
-                    page_text = ocr_text
+                # Fallback to OCR if extracted text is too short
+                if len(page_text) < min_text_chars and reader is not None:
+                    images = convert_from_path(pdf_path, dpi=dpi,
+                                               first_page=page_number + 1,
+                                               last_page=page_number + 1)
+                    if images:
+                        # Convert the PIL image to a numpy array
+                        image_np = np.array(images[0])
+                        # Use EasyOCR to read text (detail=0 returns only text)
+                        result = reader.readtext(image_np, detail=0, paragraph=True)
+                        ocr_text = " ".join(result) if result else ""
+                        ocr_text = ocr_text.strip()
+                        page_text = ocr_text
 
-            # If still empty, note it (or you could choose to skip this page)
-            if not page_text:
-                page_text = "[No text found]"
+                if not page_text:
+                    page_text = "[No text found]"
 
-            metadata = {"source": os.path.basename(pdf_path), "page": page_number + 1}
-            documents.append(Document(page_content=page_text, metadata=metadata))
+                metadata = {"source": os.path.basename(pdf_path), "page": page_number + 1}
+                documents.append(Document(page_content=page_text, metadata=metadata))
+    except PDFSyntaxError as e:
+        print(f"⚠️ Skipping file {pdf_path} due to PDFSyntaxError: {e}")
+    except Exception as e:
+        print(f"⚠️ An unexpected error occurred while processing {pdf_path}: {e}")
     return documents
-
 
 def build_pdf_vectorstore(pdf_directory: str,
                           index_save_path: str = None,
-                          tesseract_cmd: str = None,
                           min_text_chars: int = 30,
                           dpi: int = 300,
                           chunk_size: int = 500,
                           chunk_overlap: int = 100) -> FAISS:
-    """
-    Processes all PDF files in a given directory by extracting text from each page
-    (with an OCR fallback) and builds a FAISS vector store from text chunks.
-    Optionally, saves the FAISS index to a local file.
-
-    Args:
-        pdf_directory (str): Folder containing PDF files.
-        index_save_path (str, optional): Path to save the FAISS index.
-        tesseract_cmd (str, optional): Path to Tesseract executable (if needed).
-        min_text_chars (int, optional): Minimum characters required for direct text extraction.
-        dpi (int, optional): DPI for image conversion for OCR.
-        chunk_size (int, optional): Maximum number of characters per chunk.
-        chunk_overlap (int, optional): Overlap between chunks.
-
-    Returns:
-        FAISS: A FAISS vector store containing the embedded document chunks.
-    """
     all_documents = []
-    # Process each PDF in the directory
-    for filename in os.listdir(pdf_directory):
-        if filename.lower().endswith(".pdf"):
-            pdf_path = os.path.join(pdf_directory, filename)
-            docs = extract_documents_from_pdf(pdf_path,
-                                              tesseract_cmd=tesseract_cmd,
-                                              min_text_chars=min_text_chars,
-                                              dpi=dpi)
-            all_documents.extend(docs)
-    
-    # Split the extracted documents into smaller chunks
+    # Gather PDF files and sort by file size (smallest to largest)
+    file_list = [filename for filename in os.listdir(pdf_directory) if filename.lower().endswith(".pdf")]
+    file_list = sorted(file_list, key=lambda f: os.path.getsize(os.path.join(pdf_directory, f)))
+    total_files = len(file_list)
+    print(f"Found {total_files} PDF files to process (sorted by file size).")
+
+    for idx, filename in enumerate(file_list, start=1):
+        pdf_path = os.path.join(pdf_directory, filename)
+        print(f"📄 Processing file {idx}/{total_files}: {filename}...")
+        start_time = time.time()
+        docs = extract_documents_from_pdf(pdf_path,
+                                          min_text_chars=min_text_chars,
+                                          dpi=dpi)
+        all_documents.extend(docs)
+        elapsed = time.time() - start_time
+        estimated_remaining = elapsed * (total_files - idx)
+        print(f"Processed {filename} in {elapsed:.2f} seconds. Estimated remaining time: {estimated_remaining:.2f} seconds.")
+
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,
                                                    chunk_overlap=chunk_overlap)
     docs_chunks = text_splitter.split_documents(all_documents)
-    # Filter out any empty chunks
     docs_chunks = [doc for doc in docs_chunks if doc.page_content.strip()]
-    
+
     if not docs_chunks:
         raise ValueError("No valid text chunks found to build the vector store. "
                          "Check your OCR output or text splitter settings.")
-    
-    # Compute embeddings using a free, small model and build the FAISS vector store
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": device}
+    )
+    print(f"🚀 HuggingFace Embeddings running on: {embeddings.client.device}")
+
     vectorstore = FAISS.from_documents(docs_chunks, embeddings)
-    
-    # Save the vector store to a local file if a path is provided
+
+    num_gpus = faiss.get_num_gpus()
+    if num_gpus > 0:
+        print(f"🚀 Converting FAISS index to GPU (GPUs available: {num_gpus})")
+        res = faiss.StandardGpuResources()
+        cpu_index = vectorstore.index
+        gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+        vectorstore.index = gpu_index
+    else:
+        print("⚡ No GPU detected for FAISS. Using CPU index.")
+
     if index_save_path:
         vectorstore.save_local(index_save_path)
-    
+        print(f"✅ Vector store saved at: {index_save_path}")
+
     return vectorstore
 
+def rerank_documents(docs: List[Document], query: str, embeddings: HuggingFaceEmbeddings, top_k: int) -> List[Document]:
+    """
+    Reranks a list of Document objects based on their cosine similarity with the query.
+    Uses the provided embeddings to compute the similarity.
+    """
+    # Embed the query
+    query_embedding = embeddings.embed_query(query)
+    # Compute embeddings for each document chunk
+    doc_texts = [doc.page_content for doc in docs]
+    doc_embeddings = embeddings.embed_documents(doc_texts)
+    
+    similarities = []
+    for emb in doc_embeddings:
+        sim = np.dot(query_embedding, emb) / (np.linalg.norm(query_embedding) * np.linalg.norm(emb) + 1e-8)
+        similarities.append(sim)
+    
+    # Sort documents by similarity in descending order and return top_k
+    ranked = sorted(zip(docs, similarities), key=lambda x: x[1], reverse=True)
+    return [doc for doc, score in ranked[:top_k]]
 
 def retrieve_context(vectorstore, query: str, k: int = 3) -> str:
     """
-    Retrieve the top k similar document chunks from the vector store,
-    assembling them into a single context string that includes
-    source filenames and page numbers.
-    
-    Args:
-        vectorstore: The FAISS vector store.
-        query (str): The user's query.
-        k (int): Number of top matching chunks to retrieve.
-    
-    Returns:
-        str: An assembled context string.
+    Retrieves candidate document chunks from the vector store,
+    reranks them for precision, and returns a concatenated context string.
     """
-    # The similarity search automatically encodes the query.
-    retrieved_docs = vectorstore.similarity_search(query, k=k)
+    # Retrieve more candidates (k*5 instead of k*3)
+    candidates = vectorstore.similarity_search(query, k=k * 5)
+    
+    # Initialize an embeddings instance for reranking
+    rerank_embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": device}
+    )
+    
+    # Rerank the candidate documents based on cosine similarity
+    ranked_docs = rerank_documents(candidates, query, rerank_embeddings, k)
     
     context_parts = []
-    for doc in retrieved_docs:
+    for doc in ranked_docs:
         source = doc.metadata.get("source", "Unknown source")
         page = doc.metadata.get("page", "Unknown page")
         text = doc.page_content.strip()
         context_parts.append(f"Source: {source} - Page: {page}\n{text}")
-    
-    # Separate chunks clearly
-    context = "\n\n".join(context_parts)
-    return context
+    return "\n\n".join(context_parts)
 
-def load_local_index(index_save_path: str, 
+def load_local_index(index_save_path: str,
                      embeddings_model_name: str = "sentence-transformers/all-MiniLM-L6-v2") -> FAISS:
-    """
-    Loads a locally saved FAISS vector store from the given index path.
-    
-    Args:
-        index_save_path (str): Path to the saved FAISS index.
-        embeddings_model_name (str, optional): The HuggingFace model to use for embeddings.
-            Defaults to "sentence-transformers/all-MiniLM-L6-v2".
-    
-    Returns:
-        FAISS: The loaded FAISS vector store.
-    """
-    embeddings = HuggingFaceEmbeddings(model_name=embeddings_model_name)
-    vectorstore = FAISS.load_local(index_save_path, embeddings, allow_dangerous_deserialization=True)
-    return vectorstore
-
-
-def call_deepseek_local(prompt: str, model: str = "deepseek-r1:1.5b") -> str:
-    """
-    Calls the locally installed DeepSeek R1:8B model via the Ollama CLI.
-    
-    Note: No unsupported flags are used.
-    
-    Args:
-        prompt (str): The prompt to feed into the model.
-        model (str): The model identifier.
-    
-    Returns:
-        str: The raw output from the model.
-    """
-    # Build the command without any unsupported flags.
-    command = ["ollama", "run", model]
-    
-    result = subprocess.run(command, input=prompt, capture_output=True, text=True)
-    
-    if result.returncode != 0:
-        raise Exception("Local model execution failed: " + result.stderr)
-    
-    return result.stdout.strip()
-
-
-def answer_query(vectorstore, query: str, k: int = 3) -> dict:
-    """
-    Given a user query, retrieve context from the vector store, construct
-    a prompt, and generate an answer with the local DeepSeek R1:8B model.
-    The model is instructed to include both the answer and the references.
-    
-    Args:
-        vectorstore: The FAISS vector store.
-        query (str): The user query.
-        k (int): Number of retrieved chunks to use as context.
-    
-    Returns:
-        dict: A dictionary with two keys:
-              "answer": The answer text.
-              "references": The document names and pages referenced.
-    """
-    # Retrieve context (includes source file names and page numbers).
-    context = retrieve_context(vectorstore, query, k=k)
-    
-    # Construct the prompt with explicit instructions.
-    prompt = (
-        "You are a helpful assistant. Answer the query only using the following context. "
-        "Do not include any information not present in the context. Include references to the source "
-        "(i.e., file name and page number) in your answer.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Query: {query}\n\n"
-        "Please respond using the following format exactly:\n"
-        "Answer: <your answer here>\n"
-        "References: <list of source file names and page numbers, separated by commas>\n"
+    embeddings = HuggingFaceEmbeddings(
+        model_name=embeddings_model_name,
+        model_kwargs={"device": device}
     )
-    
-    # Call the local DeepSeek model.
-    output = call_deepseek_local(prompt)
-    
-    # Parse the output expecting the following format:
-    # Answer: <text>
-    # References: <text>
-    answer_lines = []
-    references_lines = []
-    current_section = None
-    for line in output.splitlines():
-        if line.startswith("Answer:"):
-            current_section = "answer"
-            answer_lines.append(line[len("Answer:"):].strip())
-        elif line.startswith("References:"):
-            current_section = "references"
-            references_lines.append(line[len("References:"):].strip())
-        else:
-            if current_section == "answer":
-                answer_lines.append(line.strip())
-            elif current_section == "references":
-                references_lines.append(line.strip())
-    
-    answer_text = "\n".join(answer_lines).strip()
-    references_text = "\n".join(references_lines).strip()
-    
-    return {"answer": answer_text, "references": references_text}
+    vectorstore = FAISS.load_local(index_save_path, embeddings, allow_dangerous_deserialization=True)
+    num_gpus = faiss.get_num_gpus()
+    if num_gpus > 0:
+        print(f"🚀 Converting loaded FAISS index to GPU (GPUs available: {num_gpus})")
+        res = faiss.StandardGpuResources()
+        cpu_index = vectorstore.index
+        gpu_index = faiss.index_cpu_to_gpu(res, 0, cpu_index)
+        vectorstore.index = gpu_index
+    else:
+        print("⚡ Loaded FAISS index using CPU.")
+    return vectorstore

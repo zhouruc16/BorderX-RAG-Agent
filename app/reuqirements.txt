@@ -5,9 +5,19 @@ pdf2image
 
 # LangChain and its dependencies (used for document splitting, embeddings, and FAISS vector store)
 langchain
+langchain-community
 faiss-cpu
 sentence-transformers
 
 # Ollama Python SDK for interacting with Ollama via its API
 ollama
 httpx
+fastapi 
+uvicorn
+
+# pytorch
+pytorch
+torchvision 
+torchaudio 
+pytorch-cuda=11.7
+
